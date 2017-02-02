@@ -14,5 +14,5 @@ def hello()
   yield(111);	# ascii 111 = 'o'
 
 var gen = hello() in
-(for i = 0, i < 5, 1.0 in
-  putchard(gen()));
+  (for i = 0, i < 5, 1.0 in
+    putchard(gen()));
