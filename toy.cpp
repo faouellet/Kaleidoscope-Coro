@@ -7,7 +7,13 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Host.h"
+#include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <cctype>
@@ -15,10 +21,9 @@
 #include <map>
 #include <string>
 #include <vector>
-#include "../include/KaleidoscopeJIT.h"
 
 using namespace llvm;
-using namespace llvm::orc;
+using namespace llvm::sys;
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -84,7 +89,7 @@ std::string getTokName(int Tok) {
   case tok_var:
     return "var";
   case tok_yield:
-      return "yield";
+    return "yield";
   }
   return std::string(1, (char)Tok);
 }
@@ -106,16 +111,17 @@ struct DebugInfo {
 
 class CoroutineCreator {
   struct CoroutineFrameInfo {
-      Value *promise;
-      Value *suspensionPt;
-      Value *coroAddr;
-      BasicBlock *suspensionBB;
-      BasicBlock *cleanupBB;
+    Value *promise;
+    Value *suspensionPt;
+    Value *coroAddr;
+    BasicBlock *suspensionBB;
+    BasicBlock *cleanupBB;
 
-      CoroutineFrameInfo() = delete;
-      CoroutineFrameInfo(Value *pv, Value *coroAddress, BasicBlock *suspendBB, BasicBlock *cleanBB)
-          : promise{ pv }, coroAddr{ coroAddress },
-          suspensionBB{ suspendBB }, cleanupBB{ cleanBB } { }
+    CoroutineFrameInfo() = delete;
+    CoroutineFrameInfo(Value *pv, Value *coroAddress, BasicBlock *suspendBB,
+                       BasicBlock *cleanBB)
+        : promise{pv}, coroAddr{coroAddress},
+          suspensionBB{suspendBB}, cleanupBB{cleanBB} {}
   };
 
   std::map<Function *, CoroutineFrameInfo> FunctionCoros;
@@ -123,26 +129,26 @@ class CoroutineCreator {
   std::map<std::string, Value *> PromiseAddrs;
 
 public:
-    void branchToCleanup(Function *F) const;
+  void branchToCleanup(Function *F) const;
 
-    void setupCoroutineFrame(Function *F);
+  void setupCoroutineFrame(Function *F);
 
-    Value *getCoroutineAddr(Function *F) const;
+  Value *getCoroutineAddr(Function *F) const;
 
-    Value *getHandle(const std::string &VarName) const;
-    void setHandle(const std::string &VarName, Value *Handle);
+  Value *getHandle(const std::string &VarName) const;
+  void setHandle(const std::string &VarName, Value *Handle);
 
-    Value *getPromise(Function *F) const;
-    Value *getPromiseAddr(const std::string &VarName) const;
-    void setupPromiseAddrAccess(const std::string &VarName);
+  Value *getPromise(Function *F) const;
+  Value *getPromiseAddr(const std::string &VarName) const;
+  void setupPromiseAddrAccess(const std::string &VarName);
 
-    void setSuspenionPt(Function *F, Value *suspendPt);  
-    
-    bool isCoroutine(Function *F) const;
-    
-    BasicBlock *setupResumeBlock(Function *F);
-    
-    void replaceFunction(Function *OldFunc, Function *NewFunc);
+  void setSuspenionPt(Function *F, Value *suspendPt);
+
+  bool isCoroutine(Function *F) const;
+
+  BasicBlock *setupResumeBlock(Function *F);
+
+  void replaceFunction(Function *OldFunc, Function *NewFunc);
 } CoroCreator;
 
 struct SourceLocation {
@@ -202,7 +208,7 @@ static int gettok() {
     if (IdentifierStr == "var")
       return tok_var;
     if (IdentifierStr == "yield")
-        return tok_yield;
+      return tok_yield;
     return tok_identifier;
   }
 
@@ -240,6 +246,7 @@ static int gettok() {
 //===----------------------------------------------------------------------===//
 // Abstract Syntax Tree (aka Parse Tree)
 //===----------------------------------------------------------------------===//
+
 namespace {
 
 raw_ostream &indent(raw_ostream &O, int size) {
@@ -252,7 +259,8 @@ class ExprAST {
 
 public:
   ExprAST(SourceLocation Loc = CurLoc) : Loc(Loc) {}
-  virtual ~ExprAST() {}
+  virtual ~ExprAST() = default;
+
   virtual Value *codegen() = 0;
   int getLine() const { return Loc.Line; }
   int getCol() const { return Loc.Col; }
@@ -295,6 +303,7 @@ class UnaryExprAST : public ExprAST {
 public:
   UnaryExprAST(char Opcode, std::unique_ptr<ExprAST> Operand)
       : Opcode(Opcode), Operand(std::move(Operand)) {}
+
   Value *codegen() override;
   raw_ostream &dump(raw_ostream &out, int ind) override {
     ExprAST::dump(out << "unary" << Opcode, ind);
@@ -369,6 +378,7 @@ public:
              std::unique_ptr<ExprAST> Body)
       : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
         Step(std::move(Step)), Body(std::move(Body)) {}
+
   Value *codegen() override;
   raw_ostream &dump(raw_ostream &out, int ind) override {
     ExprAST::dump(out << "for", ind);
@@ -401,12 +411,11 @@ public:
 };
 
 /// YieldAST - Expression class for yield
-class YieldExprAST : public ExprAST
-{
-    std::unique_ptr<ExprAST> Expr;
+class YieldExprAST : public ExprAST {
+  std::unique_ptr<ExprAST> Expr;
 
 public:
-  YieldExprAST(SourceLocation Loc, std::unique_ptr<ExprAST> Expr) 
+  YieldExprAST(SourceLocation Loc, std::unique_ptr<ExprAST> Expr)
       : ExprAST(Loc), Expr(std::move(Expr)) {}
   Value *codegen() override;
   raw_ostream &dump(raw_ostream &out, int ind) override {
@@ -457,6 +466,7 @@ public:
   FunctionAST(std::unique_ptr<PrototypeAST> Proto,
               std::unique_ptr<ExprAST> Body)
       : Proto(std::move(Proto)), Body(std::move(Body)) {}
+
   Function *codegen();
   raw_ostream &dump(raw_ostream &out, int ind) {
     indent(out, ind) << "FunctionAST\n";
@@ -465,6 +475,7 @@ public:
     return Body ? Body->dump(out, ind) : out << "null\n";
   }
 };
+
 } // end anonymous namespace
 
 //===----------------------------------------------------------------------===//
@@ -543,7 +554,7 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
   getNextToken(); // eat (
   std::vector<std::unique_ptr<ExprAST>> Args;
   if (CurTok != ')') {
-    while (1) {
+    while (true) {
       if (auto Arg = ParseExpression())
         Args.push_back(std::move(Arg));
       else
@@ -653,7 +664,7 @@ static std::unique_ptr<ExprAST> ParseVarExpr() {
   if (CurTok != tok_identifier)
     return LogError("expected identifier after var");
 
-  while (1) {
+  while (true) {
     std::string Name = IdentifierStr;
     getNextToken(); // eat identifier.
 
@@ -693,7 +704,7 @@ static std::unique_ptr<ExprAST> ParseVarExpr() {
 /// yieldexpr ::= 'yield' parenexpr
 static std::unique_ptr<ExprAST> ParseYieldExpr() {
   SourceLocation LitLoc = CurLoc;
-  
+
   getNextToken(); // eat the '('
 
   if (CurTok != '(')
@@ -756,7 +767,7 @@ static std::unique_ptr<ExprAST> ParseUnary() {
 static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
                                               std::unique_ptr<ExprAST> LHS) {
   // If this is a binop, find its precedence.
-  while (1) {
+  while (true) {
     int TokPrec = GetTokPrecedence();
 
     // If this is a binop that binds at least as tightly as the current binop,
@@ -944,7 +955,6 @@ static DISubroutineType *CreateFunctionType(unsigned NumArgs, DIFile *Unit) {
 static std::unique_ptr<Module> TheModule;
 static std::map<std::string, AllocaInst *> NamedValues;
 static std::vector<Value *> CoroHandlesInCurrentFunction;
-static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 
 Value *LogErrorV(const char *Str) {
@@ -974,7 +984,8 @@ static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction,
                                           llvm::Type *VarType = nullptr) {
   IRBuilder<> TmpB(&TheFunction->getEntryBlock(),
                    TheFunction->getEntryBlock().begin());
-  return TmpB.CreateAlloca(VarType == nullptr ? Type::getDoubleTy(TheContext) : VarType, 
+  return TmpB.CreateAlloca(VarType == nullptr ? Type::getDoubleTy(TheContext)
+                                              : VarType,
                            nullptr, VarName.c_str());
 }
 
@@ -986,12 +997,14 @@ void CoroutineCreator::setupCoroutineFrame(Function *F) {
   // First, let's make sure that work hasn't already been done for this function
   auto fnCoro = FunctionCoros.find(F);
   if (fnCoro != FunctionCoros.end())
-      return;
-  
-  // We'll keep the current insert point in memory because we're about to make a long detour back to it
+    return;
+
+  // We'll keep the current insert point in memory because we're about to make a
+  // long detour back to it
   BasicBlock *originalEntryBB = Builder.GetInsertBlock();
 
-  // Some types we'll be using when getting the coroutine intrinsic function declarations
+  // Some types we'll be using when getting the coroutine intrinsic function
+  // declarations
   PointerType *int8PtrTy = Type::getInt8PtrTy(TheContext);
   Type *int32Ty = Type::getInt32Ty(TheContext);
   Type *boolTy = Type::getInt1Ty(TheContext);
@@ -1001,95 +1014,117 @@ void CoroutineCreator::setupCoroutineFrame(Function *F) {
   Value *zeroVal = ConstantInt::get(int32Ty, APInt(32, 0));
   Value *falseVal = ConstantInt::get(boolTy, APInt(1, 0));
 
-  // The first step to generating a coroutine is to allocate a coroutine frame. To do so, we'll create a
+  // The first step to generating a coroutine is to allocate a coroutine frame.
+  // To do so, we'll create a
   // new entry block in the function dedicated to this task.
   // ----------------------------------------------------------------------------------------------------------------
   // Getting the intrinsic functions we'll need
-  Function *coroIDFn = Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_id);
-  Function *coroSizeFn = Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_size, { Type::getInt64Ty(TheContext) });
-  Function *coroBeginFn = Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_begin);
+  Function *coroIDFn =
+      Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_id);
+  Function *coroSizeFn = Intrinsic::getDeclaration(
+      TheModule.get(), Intrinsic::coro_size, {Type::getInt64Ty(TheContext)});
+  Function *coroBeginFn =
+      Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_begin);
 
   // Creating the coroutine creation block
   Function *TheFunction = Builder.GetInsertBlock()->getParent();
   BasicBlock &entryBlock = TheFunction->getEntryBlock();
-  BasicBlock *coroCreationBB = BasicBlock::Create(TheContext, "coro.creation", TheFunction, &entryBlock);
+  BasicBlock *coroCreationBB =
+      BasicBlock::Create(TheContext, "coro.creation", TheFunction, &entryBlock);
 
   Builder.SetInsertPoint(coroCreationBB);
 
   // We'll also define a promise to communicate with the caller
-  Value *promise = Builder.CreateAlloca(Type::getDoubleTy(TheContext), nullptr, "promise");
+  Value *promise =
+      Builder.CreateAlloca(Type::getDoubleTy(TheContext), nullptr, "promise");
   Value *pv = Builder.CreateBitCast(promise, int8PtrTy, "pv");
 
   // Handing out an ID for the coroutine frame
-  Value *coroId = Builder.CreateCall(coroIDFn, { zeroVal, pv, null8PtrVal, null8PtrVal }, "id");
-  
+  Value *coroId = Builder.CreateCall(
+      coroIDFn, {zeroVal, pv, null8PtrVal, null8PtrVal}, "id");
+
   // Allocating memory for the coroutine frame
   Value *coroSizeCall = Builder.CreateCall(coroSizeFn, {}, "size");
-  Type* IntPtrTy = IntegerType::getInt32Ty(TheContext);
-  Type* Int8Ty = IntegerType::getInt8Ty(TheContext);
-  Constant* allocsize = ConstantExpr::getSizeOf(Int8Ty);
+  Type *IntPtrTy = IntegerType::getInt32Ty(TheContext);
+  Type *Int8Ty = IntegerType::getInt8Ty(TheContext);
+  Constant *allocsize = ConstantExpr::getSizeOf(Int8Ty);
   allocsize = ConstantExpr::getTruncOrBitCast(allocsize, IntPtrTy);
-  Value *coroAlloc = CallInst::CreateMalloc(coroCreationBB, IntPtrTy, Int8Ty, allocsize, coroSizeCall, nullptr, "alloc");
+  Value *coroAlloc =
+      CallInst::CreateMalloc(coroCreationBB, IntPtrTy, Int8Ty, allocsize,
+                             coroSizeCall, nullptr, "alloc");
   coroCreationBB->getInstList().push_back(cast<Instruction>(coroAlloc));
-  
+
   // Getting the address to the coroutine frame
-  Value *coroHdl = Builder.CreateCall(coroBeginFn, { coroId, coroAlloc }, "hdl");
+  Value *coroHdl = Builder.CreateCall(coroBeginFn, {coroId, coroAlloc}, "hdl");
 
-  // Since we decided that the semantics of coroutines at Kaleidoscope level will be to always 
-  // call the coroutine to get a handle and then invoking the coroutine through this handle, 
-  // it is necessary to insert a suspension point here before any real work is done by the coroutine.
-  Function *coroSaveFn = Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_save);
-  Function *coroSuspendFn = Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_suspend);
+  // Since we decided that the semantics of coroutines at Kaleidoscope level
+  // will be to always
+  // call the coroutine to get a handle and then invoking the coroutine through
+  // this handle,
+  // it is necessary to insert a suspension point here before any real work is
+  // done by the coroutine.
+  Function *coroSaveFn =
+      Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_save);
+  Function *coroSuspendFn =
+      Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_suspend);
 
-  Value *coroEntrySavePt = Builder.CreateCall(coroSaveFn, { coroHdl });
-  Builder.CreateCall(coroSuspendFn, { coroEntrySavePt, falseVal });
+  Value *coroEntrySavePt = Builder.CreateCall(coroSaveFn, {coroHdl});
+  Builder.CreateCall(coroSuspendFn, {coroEntrySavePt, falseVal});
 
   // We then link the coroutine creation block to the previous entry block
   Builder.CreateBr(&entryBlock);
   // ----------------------------------------------------------------------------------------------------------------
 
-  // The next step after handling the creation of the coroutine frame is handling the return of the function. 
+  // The next step after handling the creation of the coroutine frame is
+  // handling the return of the function.
   // In this case as well, a new basic block will be created to handle it.
   // ----------------------------------------------------------------------------------------------------------------
   // Getting the llvm.coro.end intrinsic function
-  Function *coroEndFn = Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_end);
+  Function *coroEndFn =
+      Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_end);
 
   // Creating the suspension or return block
-  BasicBlock *coroSuspensionBB = BasicBlock::Create(TheContext, "coro.suspend_or_ret", TheFunction);
+  BasicBlock *coroSuspensionBB =
+      BasicBlock::Create(TheContext, "coro.suspend_or_ret", TheFunction);
 
   // This block will simply return control back to the caller
   Builder.SetInsertPoint(coroSuspensionBB);
-  Builder.CreateCall(coroEndFn, { coroHdl, falseVal });
+  Builder.CreateCall(coroEndFn, {coroHdl, falseVal});
   Builder.CreateRet(coroHdl);
   // ----------------------------------------------------------------------------------------------------------------
 
-
-  // Lest we forget, we should cleanup before we return from a function using coroutine.
+  // Lest we forget, we should cleanup before we return from a function using
+  // coroutine.
   // ----------------------------------------------------------------------------------------------------------------
   // Getting the llvm.coro.free intrinsic function
-  Function *coroFreeFn = Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_free);
+  Function *coroFreeFn =
+      Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_free);
 
   // Creating the cleanup block
-  BasicBlock *coroCleanupBB = BasicBlock::Create(TheContext, "coro.cleanup", TheFunction);
+  BasicBlock *coroCleanupBB =
+      BasicBlock::Create(TheContext, "coro.cleanup", TheFunction);
 
-  // This block will delete the coroutine frame and branch to the suspend or return block
+  // This block will delete the coroutine frame and branch to the suspend or
+  // return block
   Builder.SetInsertPoint(coroCleanupBB);
-  Value *coroFreeCall = Builder.CreateCall(coroFreeFn, { coroId, coroHdl }, "mem");
+  Value *coroFreeCall =
+      Builder.CreateCall(coroFreeFn, {coroId, coroHdl}, "mem");
   Value *coroFree = CallInst::CreateFree(coroFreeCall, coroCleanupBB);
   coroCleanupBB->getInstList().push_back(cast<Instruction>(coroFree));
   Builder.CreateBr(coroSuspensionBB);
   // ----------------------------------------------------------------------------------------------------------------
 
-
-  // Last but definitely not least, we should insert the coroutine in the function's logic
+  // Last but definitely not least, we should insert the coroutine in the
+  // function's logic
   // ----------------------------------------------------------------------------------------------------------------
   // Finally getting back to the original insert point
   Builder.SetInsertPoint(originalEntryBB);
-  //Builder.CreateBr(coroCleanupBB);
+  // Builder.CreateBr(coroCleanupBB);
   // ----------------------------------------------------------------------------------------------------------------
 
-  auto coroSuccess = FunctionCoros.emplace(F, CoroutineFrameInfo{ promise, coroHdl, coroSuspensionBB, coroCleanupBB });
-  assert(coroSuccess.second);   // Sanity check
+  auto coroSuccess = FunctionCoros.emplace(
+      F, CoroutineFrameInfo{promise, coroHdl, coroSuspensionBB, coroCleanupBB});
+  assert(coroSuccess.second); // Sanity check
   return;
 }
 
@@ -1098,22 +1133,26 @@ BasicBlock *CoroutineCreator::setupResumeBlock(Function *F) {
   if (coroFrameIt == FunctionCoros.end())
     return nullptr;
 
-  CoroutineFrameInfo& coroInfo = coroFrameIt->second;
+  CoroutineFrameInfo &coroInfo = coroFrameIt->second;
 
   // Adding a resume block
-  BasicBlock *resumeBB = BasicBlock::Create(TheContext, "coro.resume", Builder.GetInsertBlock()->getParent());
+  BasicBlock *resumeBB = BasicBlock::Create(
+      TheContext, "coro.resume", Builder.GetInsertBlock()->getParent());
   BranchInst *brInst = BranchInst::Create(coroInfo.cleanupBB);
   resumeBB->getInstList().push_back(brInst);
 
-  // Now that we have a resume block, we need to change the unconditional branch from the suspension block
+  // Now that we have a resume block, we need to change the unconditional branch
+  // from the suspension block
   // to the cleanup block into a conditional one
   BasicBlock *entryBB = Builder.GetInsertBlock();
   if (llvm::isa<BranchInst>(&(entryBB->getInstList().front())))
-      entryBB->getInstList().pop_front();
+    entryBB->getInstList().pop_front();
 
-  SwitchInst *switchInst = Builder.CreateSwitch(coroInfo.suspensionPt, coroInfo.suspensionBB, 2);
+  SwitchInst *switchInst =
+      Builder.CreateSwitch(coroInfo.suspensionPt, coroInfo.suspensionBB, 2);
   switchInst->addCase(ConstantInt::get(TheContext, APInt(32, 0)), resumeBB);
-  switchInst->addCase(ConstantInt::get(TheContext, APInt(32, 1)), coroInfo.cleanupBB);
+  switchInst->addCase(ConstantInt::get(TheContext, APInt(32, 1)),
+                      coroInfo.cleanupBB);
 
   return resumeBB;
 }
@@ -1121,14 +1160,13 @@ BasicBlock *CoroutineCreator::setupResumeBlock(Function *F) {
 void CoroutineCreator::branchToCleanup(Function *F) const {
   auto coroFrameIt = FunctionCoros.find(F);
   if (coroFrameIt != FunctionCoros.end())
-      Builder.CreateBr(coroFrameIt->second.cleanupBB);
-  
+    Builder.CreateBr(coroFrameIt->second.cleanupBB);
 }
 
 Value *CoroutineCreator::getCoroutineAddr(Function *F) const {
   auto coroFrameIt = FunctionCoros.find(F);
   if (coroFrameIt != FunctionCoros.end())
-      return coroFrameIt->second.coroAddr;
+    return coroFrameIt->second.coroAddr;
 
   return nullptr;
 }
@@ -1136,20 +1174,19 @@ Value *CoroutineCreator::getCoroutineAddr(Function *F) const {
 Value *CoroutineCreator::getHandle(const std::string &VarName) const {
   auto coroFrameIt = CoroHandles.find(VarName);
   if (coroFrameIt != CoroHandles.end())
-      return coroFrameIt->second;
+    return coroFrameIt->second;
 
   return nullptr;
 }
 
 void CoroutineCreator::setHandle(const std::string &VarName, Value *Handle) {
-    CoroHandles[VarName] = Handle;
+  CoroHandles[VarName] = Handle;
 }
-
 
 Value *CoroutineCreator::getPromise(Function *F) const {
   auto coroFrameIt = FunctionCoros.find(F);
   if (coroFrameIt != FunctionCoros.end())
-      return coroFrameIt->second.promise;
+    return coroFrameIt->second.promise;
 
   return nullptr;
 }
@@ -1157,7 +1194,7 @@ Value *CoroutineCreator::getPromise(Function *F) const {
 Value *CoroutineCreator::getPromiseAddr(const std::string &VarName) const {
   auto promiseAddrIt = PromiseAddrs.find(VarName);
   if (promiseAddrIt != PromiseAddrs.end())
-      return promiseAddrIt->second;
+    return promiseAddrIt->second;
 
   return nullptr;
 }
@@ -1165,20 +1202,24 @@ Value *CoroutineCreator::getPromiseAddr(const std::string &VarName) const {
 void CoroutineCreator::setSuspenionPt(Function *F, Value *suspendPt) {
   auto coroFrameIt = FunctionCoros.find(F);
   if (coroFrameIt != FunctionCoros.end())
-      coroFrameIt->second.suspensionPt = suspendPt;
+    coroFrameIt->second.suspensionPt = suspendPt;
 }
 
-
 void CoroutineCreator::setupPromiseAddrAccess(const std::string &VarName) {
-  Function *coroPromiseFn = Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_promise);
+  Function *coroPromiseFn =
+      Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_promise);
 
   std::vector<Value *> coroPromiseFnArgs;
   coroPromiseFnArgs.push_back(getHandle(VarName));
-  coroPromiseFnArgs.push_back(ConstantInt::get(Type::getInt32Ty(TheContext), APInt(32, 4)));
-  coroPromiseFnArgs.push_back(ConstantInt::get(Type::getInt1Ty(TheContext), APInt(1, 0)));
+  coroPromiseFnArgs.push_back(
+      ConstantInt::get(Type::getInt32Ty(TheContext), APInt(32, 4)));
+  coroPromiseFnArgs.push_back(
+      ConstantInt::get(Type::getInt1Ty(TheContext), APInt(1, 0)));
 
-  Value *coroPromiseAddrRaw = Builder.CreateCall(coroPromiseFn, coroPromiseFnArgs, "promise.addr.raw");
-  Value *coroPromiseAddr = Builder.CreateBitCast(coroPromiseAddrRaw, Type::getDoublePtrTy(TheContext), "promise.addr");
+  Value *coroPromiseAddrRaw =
+      Builder.CreateCall(coroPromiseFn, coroPromiseFnArgs, "promise.addr.raw");
+  Value *coroPromiseAddr = Builder.CreateBitCast(
+      coroPromiseAddrRaw, Type::getDoublePtrTy(TheContext), "promise.addr");
 
   PromiseAddrs[VarName] = coroPromiseAddr;
 }
@@ -1293,13 +1334,17 @@ Value *CallExprAST::codegen() {
     return LogErrorV("Unknown function referenced");
 
   if (handle != nullptr) {
-    // If the function is a coroutine and we already called it once, we'll resume it with its handle 
-    Function *coroResumeFn = Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_resume);
-    Value *callInst = Builder.CreateCall(coroResumeFn, { handle });
+    // If the function is a coroutine and we already called it once, we'll
+    // resume it with its handle
+    Function *coroResumeFn =
+        Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_resume);
+    Value *callInst = Builder.CreateCall(coroResumeFn, {handle});
     handle = callInst;
 
-    // To get the value yielded by the coroutine, we have to fetch it through its promise
-    Value *coroVal = Builder.CreateLoad(CoroCreator.getPromiseAddr(Callee), "coro.val");
+    // To get the value yielded by the coroutine, we have to fetch it through
+    // its promise
+    Value *coroVal =
+        Builder.CreateLoad(CoroCreator.getPromiseAddr(Callee), "coro.val");
 
     return coroVal;
   }
@@ -1308,12 +1353,11 @@ Value *CallExprAST::codegen() {
   if (CalleeF->arg_size() != Args.size())
     return LogErrorV("Incorrect # arguments passed");
 
-  
   std::vector<Value *> ArgsV;
   for (unsigned i = 0, e = Args.size(); i != e; ++i) {
-      ArgsV.push_back(Args[i]->codegen());
-      if (!ArgsV.back())
-          return nullptr;
+    ArgsV.push_back(Args[i]->codegen());
+    if (!ArgsV.back())
+      return nullptr;
   }
 
   return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
@@ -1499,14 +1543,15 @@ Value *VarExprAST::codegen() {
       InitVal = ConstantFP::get(TheContext, APFloat(0.0));
     }
 
-    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName, InitVal->getType());
+    AllocaInst *Alloca =
+        CreateEntryBlockAlloca(TheFunction, VarName, InitVal->getType());
     Builder.CreateStore(InitVal, Alloca);
 
     // If the value type is not a double then it must be a handle to a coroutine
     if (InitVal->getType() == Type::getInt8PtrTy(TheContext)) {
-        CoroCreator.setHandle(VarName, InitVal);
-        CoroCreator.setupPromiseAddrAccess(VarName);
-        CoroHandlesInCurrentFunction.push_back(InitVal);
+      CoroCreator.setHandle(VarName, InitVal);
+      CoroCreator.setupPromiseAddrAccess(VarName);
+      CoroHandlesInCurrentFunction.push_back(InitVal);
     }
 
     // Remember the old variable binding so that we can restore the binding when
@@ -1536,22 +1581,27 @@ Value *YieldExprAST::codegen() {
   // Generate the basic blocks needed for a coroutine
   Function *F = Builder.GetInsertBlock()->getParent();
   CoroCreator.setupCoroutineFrame(F);
-  
+
   // Filling the entry block with the expression to be yielded
   Builder.SetInsertPoint(Builder.GetInsertBlock());
   Value *exprVal = Expr->codegen();
   Builder.CreateStore(exprVal, CoroCreator.getPromise(F));
- 
-  Function *coroSaveFn = Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_save);
-  Function *coroSuspendFn = Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_suspend);
 
-  Value *coroSavePt = Builder.CreateCall(coroSaveFn, { CoroCreator.getCoroutineAddr(F) });
-  Value *coroSuspendCall = Builder.CreateCall(coroSuspendFn, { coroSavePt, ConstantInt::get(Type::getInt1Ty(TheContext), APInt(1, 0)) });
+  Function *coroSaveFn =
+      Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_save);
+  Function *coroSuspendFn =
+      Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_suspend);
+
+  Value *coroSavePt =
+      Builder.CreateCall(coroSaveFn, {CoroCreator.getCoroutineAddr(F)});
+  Value *coroSuspendCall = Builder.CreateCall(
+      coroSuspendFn,
+      {coroSavePt, ConstantInt::get(Type::getInt1Ty(TheContext), APInt(1, 0))});
 
   CoroCreator.setSuspenionPt(F, coroSuspendCall);
 
   Builder.SetInsertPoint(CoroCreator.setupResumeBlock(F));
-  
+
   return exprVal;
 }
 
@@ -1643,8 +1693,10 @@ Function *FunctionAST::codegen() {
     const bool isCoroutine = CoroCreator.isCoroutine(TheFunction);
 
     if (isCoroutine) {
-      // With the way coroutine IR generation is done, we can end up with an empty exit block.
-      // If that's the case, we fill it with an unconditional branch to the coroutine cleanup block
+      // With the way coroutine IR generation is done, we can end up with an
+      // empty exit block.
+      // If that's the case, we fill it with an unconditional branch to the
+      // coroutine cleanup block
       BasicBlock *exitBB = Builder.GetInsertBlock();
       if (exitBB->empty()) {
         CoroCreator.branchToCleanup(TheFunction);
@@ -1652,31 +1704,38 @@ Function *FunctionAST::codegen() {
 
     } else {
       // Destroy any coroutine that might have been spawned
-      Function *coroDestroyFn = Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_destroy);
-      for (const auto& handle : CoroHandlesInCurrentFunction)
-        Builder.CreateCall(coroDestroyFn, { handle });
+      Function *coroDestroyFn =
+          Intrinsic::getDeclaration(TheModule.get(), Intrinsic::coro_destroy);
+      for (const auto &handle : CoroHandlesInCurrentFunction)
+        Builder.CreateCall(coroDestroyFn, {handle});
       // Finish off the function.
       Builder.CreateRet(RetVal);
     }
-    
+
     // Pop off the lexical block for the function.
     KSDbgInfo.LexicalBlocks.pop_back();
 
-    // In the case of a coroutine, we have to change the function prototype so that it
-    // returns a handle to a coroutine instead of the value computed by the function's body
+    // In the case of a coroutine, we have to change the function prototype so
+    // that it
+    // returns a handle to a coroutine instead of the value computed by the
+    // function's body
     if (isCoroutine) {
       // Make the function type:  i8 *(double,double) etc.
-      std::vector<Type *> Doubles(TheFunction->arg_size(), Type::getDoubleTy(TheContext));
-      FunctionType *NFTy = FunctionType::get(Type::getInt8PtrTy(TheContext), Doubles, false);
+      std::vector<Type *> Doubles(TheFunction->arg_size(),
+                                  Type::getDoubleTy(TheContext));
+      FunctionType *NFTy =
+          FunctionType::get(Type::getInt8PtrTy(TheContext), Doubles, false);
 
       // Create a new function and transfer the content of the old one in it
       Function *NF = Function::Create(NFTy, TheFunction->getLinkage());
       NF->copyAttributesFrom(TheFunction);
       NF->setComdat(TheFunction->getComdat());
       NF->setAttributes(TheFunction->getAttributes());
-      TheFunction->getParent()->getFunctionList().insert(TheFunction->getIterator(), NF);
+      TheFunction->getParent()->getFunctionList().insert(
+          TheFunction->getIterator(), NF);
       NF->takeName(TheFunction);
-      NF->getBasicBlockList().splice(NF->begin(), TheFunction->getBasicBlockList());
+      NF->getBasicBlockList().splice(NF->begin(),
+                                     TheFunction->getBasicBlockList());
 
       // Patch the pointer to LLVM function in debug info descriptor.
       NF->setSubprogram(TheFunction->getSubprogram());
@@ -1713,7 +1772,6 @@ Function *FunctionAST::codegen() {
 static void InitializeModule() {
   // Open a new module.
   TheModule = llvm::make_unique<Module>("my cool jit", TheContext);
-  TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
 }
 
 static void HandleDefinition() {
@@ -1752,7 +1810,7 @@ static void HandleTopLevelExpression() {
 
 /// top ::= definition | external | expression | ';'
 static void MainLoop() {
-  while (1) {
+  while (true) {
     switch (CurTok) {
     case tok_eof:
       return;
@@ -1793,10 +1851,6 @@ extern "C" double printd(double X) {
 //===----------------------------------------------------------------------===//
 
 int main() {
-  InitializeNativeTarget();
-  InitializeNativeTargetAsmPrinter();
-  InitializeNativeTargetAsmParser();
-
   // Install standard binary operators.
   // 1 is lowest precedence.
   BinopPrecedence['='] = 2;
@@ -1807,8 +1861,6 @@ int main() {
 
   // Prime the first token.
   getNextToken();
-
-  TheJIT = llvm::make_unique<KaleidoscopeJIT>();
 
   InitializeModule();
 
@@ -1836,8 +1888,64 @@ int main() {
   // Finalize the debug info.
   DBuilder->finalize();
 
-  // Print out all of the generated code.
-  TheModule->print(errs(), nullptr);
+  // Initialize the target registry etc.
+  //InitializeAllTargetInfos();
+  //InitializeAllTargets();
+  //InitializeAllTargetMCs();
+  //InitializeAllAsmParsers();
+  //InitializeAllAsmPrinters();
+
+  LLVMInitializeX86TargetInfo();
+  LLVMInitializeX86Target();
+  LLVMInitializeX86TargetMC();
+  LLVMInitializeX86AsmParser();
+  LLVMInitializeX86AsmPrinter();
+
+  auto TargetTriple = sys::getDefaultTargetTriple();
+  TheModule->setTargetTriple(TargetTriple);
+
+  std::string Error;
+  auto Target = TargetRegistry::lookupTarget(TargetTriple, Error);
+
+  // Print an error and exit if we couldn't find the requested target.
+  // This generally occurs if we've forgotten to initialise the
+  // TargetRegistry or we have a bogus target triple.
+  if (!Target) {
+    errs() << Error;
+    return 1;
+  }
+
+  auto CPU = "generic";
+  auto Features = "";
+
+  TargetOptions opt;
+  auto RM = Optional<Reloc::Model>();
+  auto TheTargetMachine =
+      Target->createTargetMachine(TargetTriple, CPU, Features, opt, RM);
+
+  TheModule->setDataLayout(TheTargetMachine->createDataLayout());
+
+  auto Filename = "output.o";
+  std::error_code EC;
+  raw_fd_ostream dest(Filename, EC, sys::fs::F_None);
+
+  if (EC) {
+    errs() << "Could not open file: " << EC.message();
+    return 1;
+  }
+
+  legacy::PassManager pass;
+  auto FileType = TargetMachine::CGFT_ObjectFile;
+
+  if (TheTargetMachine->addPassesToEmitFile(pass, dest, FileType)) {
+    errs() << "TheTargetMachine can't emit a file of this type";
+    return 1;
+  }
+
+  pass.run(*TheModule);
+  dest.flush();
+
+  outs() << "Wrote " << Filename << "\n";
 
   return 0;
 }
