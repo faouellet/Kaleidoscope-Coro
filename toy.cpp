@@ -919,7 +919,7 @@ DIType *DebugInfo::getDoubleTy() {
   if (DblTy)
     return DblTy;
 
-  DblTy = DBuilder->createBasicType("double", 64, 64);
+  DblTy = DBuilder->createBasicType("double", 64, 64, dwarf::DW_ATE_float);
   return DblTy;
 }
 
