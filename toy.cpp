@@ -21,9 +21,11 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "../include/KaleidoscopeJIT.h"
 
 using namespace llvm;
 using namespace llvm::sys;
+using namespace llvm::orc;
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -259,8 +261,7 @@ class ExprAST {
 
 public:
   ExprAST(SourceLocation Loc = CurLoc) : Loc(Loc) {}
-  virtual ~ExprAST() = default;
-
+  virtual ~ExprAST() {}
   virtual Value *codegen() = 0;
   int getLine() const { return Loc.Line; }
   int getCol() const { return Loc.Col; }
@@ -303,7 +304,6 @@ class UnaryExprAST : public ExprAST {
 public:
   UnaryExprAST(char Opcode, std::unique_ptr<ExprAST> Operand)
       : Opcode(Opcode), Operand(std::move(Operand)) {}
-
   Value *codegen() override;
   raw_ostream &dump(raw_ostream &out, int ind) override {
     ExprAST::dump(out << "unary" << Opcode, ind);
@@ -378,7 +378,6 @@ public:
              std::unique_ptr<ExprAST> Body)
       : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
         Step(std::move(Step)), Body(std::move(Body)) {}
-
   Value *codegen() override;
   raw_ostream &dump(raw_ostream &out, int ind) override {
     ExprAST::dump(out << "for", ind);
@@ -466,7 +465,6 @@ public:
   FunctionAST(std::unique_ptr<PrototypeAST> Proto,
               std::unique_ptr<ExprAST> Body)
       : Proto(std::move(Proto)), Body(std::move(Body)) {}
-
   Function *codegen();
   raw_ostream &dump(raw_ostream &out, int ind) {
     indent(out, ind) << "FunctionAST\n";
@@ -475,7 +473,6 @@ public:
     return Body ? Body->dump(out, ind) : out << "null\n";
   }
 };
-
 } // end anonymous namespace
 
 //===----------------------------------------------------------------------===//
@@ -554,7 +551,7 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
   getNextToken(); // eat (
   std::vector<std::unique_ptr<ExprAST>> Args;
   if (CurTok != ')') {
-    while (true) {
+    while (1) {
       if (auto Arg = ParseExpression())
         Args.push_back(std::move(Arg));
       else
@@ -664,7 +661,7 @@ static std::unique_ptr<ExprAST> ParseVarExpr() {
   if (CurTok != tok_identifier)
     return LogError("expected identifier after var");
 
-  while (true) {
+  while (1) {
     std::string Name = IdentifierStr;
     getNextToken(); // eat identifier.
 
@@ -767,7 +764,7 @@ static std::unique_ptr<ExprAST> ParseUnary() {
 static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
                                               std::unique_ptr<ExprAST> LHS) {
   // If this is a binop, find its precedence.
-  while (true) {
+  while (1) {
     int TokPrec = GetTokPrecedence();
 
     // If this is a binop that binds at least as tightly as the current binop,
@@ -852,7 +849,7 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
     // Read the precedence if present.
     if (CurTok == tok_number) {
       if (NumVal < 1 || NumVal > 100)
-        return LogErrorP("Invalid precedecnce: must be 1..100");
+        return LogErrorP("Invalid precedence: must be 1..100");
       BinaryPrecedence = (unsigned)NumVal;
       getNextToken();
     }
@@ -919,7 +916,7 @@ DIType *DebugInfo::getDoubleTy() {
   if (DblTy)
     return DblTy;
 
-  DblTy = DBuilder->createBasicType("double", 64, 64, dwarf::DW_ATE_float);
+  DblTy = DBuilder->createBasicType("double", 64, dwarf::DW_ATE_float);
   return DblTy;
 }
 
@@ -955,6 +952,7 @@ static DISubroutineType *CreateFunctionType(unsigned NumArgs, DIFile *Unit) {
 static std::unique_ptr<Module> TheModule;
 static std::map<std::string, AllocaInst *> NamedValues;
 static std::vector<Value *> CoroHandlesInCurrentFunction;
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 
 Value *LogErrorV(const char *Str) {
@@ -1370,7 +1368,7 @@ Value *IfExprAST::codegen() {
   if (!CondV)
     return nullptr;
 
-  // Convert condition to a bool by comparing equal to 0.0.
+  // Convert condition to a bool by comparing non-equal to 0.0.
   CondV = Builder.CreateFCmpONE(
       CondV, ConstantFP::get(TheContext, APFloat(0.0)), "ifcond");
 
@@ -1495,7 +1493,7 @@ Value *ForExprAST::codegen() {
   Value *NextVar = Builder.CreateFAdd(CurVar, StepVal, "nextvar");
   Builder.CreateStore(NextVar, Alloca);
 
-  // Convert condition to a bool by comparing equal to 0.0.
+  // Convert condition to a bool by comparing non-equal to 0.0.
   EndCond = Builder.CreateFCmpONE(
       EndCond, ConstantFP::get(TheContext, APFloat(0.0)), "loopcond");
 
@@ -1543,8 +1541,7 @@ Value *VarExprAST::codegen() {
       InitVal = ConstantFP::get(TheContext, APFloat(0.0));
     }
 
-    AllocaInst *Alloca =
-        CreateEntryBlockAlloca(TheFunction, VarName, InitVal->getType());
+    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
     Builder.CreateStore(InitVal, Alloca);
 
     // If the value type is not a double then it must be a handle to a coroutine
@@ -1772,6 +1769,7 @@ Function *FunctionAST::codegen() {
 static void InitializeModule() {
   // Open a new module.
   TheModule = llvm::make_unique<Module>("my cool jit", TheContext);
+  TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
 }
 
 static void HandleDefinition() {
@@ -1810,7 +1808,7 @@ static void HandleTopLevelExpression() {
 
 /// top ::= definition | external | expression | ';'
 static void MainLoop() {
-  while (true) {
+  while (1) {
     switch (CurTok) {
     case tok_eof:
       return;
@@ -1834,14 +1832,20 @@ static void MainLoop() {
 // "Library" functions that can be "extern'd" from user code.
 //===----------------------------------------------------------------------===//
 
+#ifdef LLVM_ON_WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
 /// putchard - putchar that takes a double and returns 0.
-extern "C" double putchard(double X) {
+extern "C" DLLEXPORT double putchard(double X) {
   fputc((char)X, stderr);
   return 0;
 }
 
 /// printd - printf that takes a double prints it as "%f\n", returning 0.
-extern "C" double printd(double X) {
+extern "C" DLLEXPORT double printd(double X) {
   fprintf(stderr, "%f\n", X);
   return 0;
 }
@@ -1851,6 +1855,10 @@ extern "C" double printd(double X) {
 //===----------------------------------------------------------------------===//
 
 int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
   // Install standard binary operators.
   // 1 is lowest precedence.
   BinopPrecedence['='] = 2;
@@ -1861,6 +1869,8 @@ int main() {
 
   // Prime the first token.
   getNextToken();
+
+  TheJIT = llvm::make_unique<KaleidoscopeJIT>();
 
   InitializeModule();
 
@@ -1880,7 +1890,7 @@ int main() {
   // but we'd like actual source locations.
   KSDbgInfo.TheCU = DBuilder->createCompileUnit(
       dwarf::DW_LANG_C, DBuilder->createFile("test.ks", "."),
-      "Kaleidoscope Compiler", false, "", 0);
+      "Kaleidoscope Compiler", 0, "", 0);
 
   // Run the main "interpreter loop" now.
   MainLoop();
@@ -1888,64 +1898,8 @@ int main() {
   // Finalize the debug info.
   DBuilder->finalize();
 
-  // Initialize the target registry etc.
-  //InitializeAllTargetInfos();
-  //InitializeAllTargets();
-  //InitializeAllTargetMCs();
-  //InitializeAllAsmParsers();
-  //InitializeAllAsmPrinters();
-
-  LLVMInitializeX86TargetInfo();
-  LLVMInitializeX86Target();
-  LLVMInitializeX86TargetMC();
-  LLVMInitializeX86AsmParser();
-  LLVMInitializeX86AsmPrinter();
-
-  auto TargetTriple = sys::getDefaultTargetTriple();
-  TheModule->setTargetTriple(TargetTriple);
-
-  std::string Error;
-  auto Target = TargetRegistry::lookupTarget(TargetTriple, Error);
-
-  // Print an error and exit if we couldn't find the requested target.
-  // This generally occurs if we've forgotten to initialise the
-  // TargetRegistry or we have a bogus target triple.
-  if (!Target) {
-    errs() << Error;
-    return 1;
-  }
-
-  auto CPU = "generic";
-  auto Features = "";
-
-  TargetOptions opt;
-  auto RM = Optional<Reloc::Model>();
-  auto TheTargetMachine =
-      Target->createTargetMachine(TargetTriple, CPU, Features, opt, RM);
-
-  TheModule->setDataLayout(TheTargetMachine->createDataLayout());
-
-  auto Filename = "output.o";
-  std::error_code EC;
-  raw_fd_ostream dest(Filename, EC, sys::fs::F_None);
-
-  if (EC) {
-    errs() << "Could not open file: " << EC.message();
-    return 1;
-  }
-
-  legacy::PassManager pass;
-  auto FileType = TargetMachine::CGFT_ObjectFile;
-
-  if (TheTargetMachine->addPassesToEmitFile(pass, dest, FileType)) {
-    errs() << "TheTargetMachine can't emit a file of this type";
-    return 1;
-  }
-
-  pass.run(*TheModule);
-  dest.flush();
-
-  outs() << "Wrote " << Filename << "\n";
+  // Print out all of the generated code.
+  TheModule->print(errs(), nullptr);
 
   return 0;
 }
