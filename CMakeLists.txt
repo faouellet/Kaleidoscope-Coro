@@ -13,6 +13,6 @@ add_definitions(${LLVM_DEFINITIONS})
 
 add_executable(kcoro toy.cpp)
 
-llvm_map_components_to_libnames(llvm_libs core x86asmparser x86codegen)
+llvm_map_components_to_libnames(llvm_libs core orcjit x86asmparser x86codegen)
 
 target_link_libraries(kcoro ${llvm_libs})
