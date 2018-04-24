@@ -304,7 +304,6 @@ class UnaryExprAST : public ExprAST {
 public:
   UnaryExprAST(char Opcode, std::unique_ptr<ExprAST> Operand)
       : Opcode(Opcode), Operand(std::move(Operand)) {}
-
   Value *codegen() override;
   raw_ostream &dump(raw_ostream &out, int ind) override {
     ExprAST::dump(out << "unary" << Opcode, ind);
@@ -379,7 +378,6 @@ public:
              std::unique_ptr<ExprAST> Body)
       : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
         Step(std::move(Step)), Body(std::move(Body)) {}
-
   Value *codegen() override;
   raw_ostream &dump(raw_ostream &out, int ind) override {
     ExprAST::dump(out << "for", ind);
@@ -467,7 +465,6 @@ public:
   FunctionAST(std::unique_ptr<PrototypeAST> Proto,
               std::unique_ptr<ExprAST> Body)
       : Proto(std::move(Proto)), Body(std::move(Body)) {}
-
   Function *codegen();
   raw_ostream &dump(raw_ostream &out, int ind) {
     indent(out, ind) << "FunctionAST\n";
@@ -476,11 +473,6 @@ public:
     return Body ? Body->dump(out, ind) : out << "null\n";
   }
 };
-
-} // end anonymous namespace
-
-//===----------------------------------------------------------------------===//
-// Parser
 //===----------------------------------------------------------------------===//
 
 /// CurTok/getNextToken - Provide a simple token buffer.  CurTok is the current
@@ -853,7 +845,7 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
     // Read the precedence if present.
     if (CurTok == tok_number) {
       if (NumVal < 1 || NumVal > 100)
-        return LogErrorP("Invalid precedecnce: must be 1..100");
+        return LogErrorP("Invalid precedence: must be 1..100");
       BinaryPrecedence = (unsigned)NumVal;
       getNextToken();
     }
@@ -1835,14 +1827,20 @@ static void MainLoop() {
 // "Library" functions that can be "extern'd" from user code.
 //===----------------------------------------------------------------------===//
 
+#ifdef LLVM_ON_WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
 /// putchard - putchar that takes a double and returns 0.
-extern "C" double putchard(double X) {
+extern "C" DLLEXPORT double putchard(double X) {
   fputc((char)X, stderr);
   return 0;
 }
 
 /// printd - printf that takes a double prints it as "%f\n", returning 0.
-extern "C" double printd(double X) {
+extern "C" DLLEXPORT double printd(double X) {
   fprintf(stderr, "%f\n", X);
   return 0;
 }
