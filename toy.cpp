@@ -1,3 +1,5 @@
+#include "KaleidoscopeJIT.h"
+
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/Analysis/BasicAliasAnalysis.h>
 #include <llvm/Analysis/Passes.h>
@@ -7,15 +9,8 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
-#include <llvm/Support/FileSystem.h>
-#include <llvm/Support/Host.h>
-#include <llvm/Support/TargetRegistry.h>
 #include <llvm/Support/TargetSelect.h>
-#include <llvm/Support/raw_ostream.h>
-#include <llvm/Target/TargetMachine.h>
-#include <llvm/Target/TargetOptions.h>
 #include <llvm/Transforms/Scalar.h>
-#include <llvm/Transforms/Utils/Cloning.h>
 
 #include <cctype>
 #include <cstdio>
@@ -24,7 +19,7 @@
 #include <vector>
 
 using namespace llvm;
-using namespace llvm::sys;
+using namespace llvm::orc;
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -247,7 +242,6 @@ static int gettok() {
 //===----------------------------------------------------------------------===//
 // Abstract Syntax Tree (aka Parse Tree)
 //===----------------------------------------------------------------------===//
-
 namespace {
 
 raw_ostream &indent(raw_ostream &O, int size) {
@@ -260,7 +254,7 @@ class ExprAST {
 
 public:
   ExprAST(SourceLocation Loc = CurLoc) : Loc(Loc) {}
-  virtual ~ExprAST() = default;
+  virtual ~ExprAST() {}
 
   virtual Value *codegen() = 0;
   int getLine() const { return Loc.Line; }
@@ -473,6 +467,10 @@ public:
     return Body ? Body->dump(out, ind) : out << "null\n";
   }
 };
+} // end anonymous namespace
+
+//===----------------------------------------------------------------------===//
+// Parser
 //===----------------------------------------------------------------------===//
 
 /// CurTok/getNextToken - Provide a simple token buffer.  CurTok is the current
@@ -547,7 +545,7 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
   getNextToken(); // eat (
   std::vector<std::unique_ptr<ExprAST>> Args;
   if (CurTok != ')') {
-    while (true) {
+    while (1) {
       if (auto Arg = ParseExpression())
         Args.push_back(std::move(Arg));
       else
@@ -657,7 +655,7 @@ static std::unique_ptr<ExprAST> ParseVarExpr() {
   if (CurTok != tok_identifier)
     return LogError("expected identifier after var");
 
-  while (true) {
+  while (1) {
     std::string Name = IdentifierStr;
     getNextToken(); // eat identifier.
 
@@ -760,7 +758,7 @@ static std::unique_ptr<ExprAST> ParseUnary() {
 static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
                                               std::unique_ptr<ExprAST> LHS) {
   // If this is a binop, find its precedence.
-  while (true) {
+  while (1) {
     int TokPrec = GetTokPrecedence();
 
     // If this is a binop that binds at least as tightly as the current binop,
@@ -912,7 +910,7 @@ DIType *DebugInfo::getDoubleTy() {
   if (DblTy)
     return DblTy;
 
-  DblTy = DBuilder->createBasicType("double", 64, 64);
+  DblTy = DBuilder->createBasicType("double", 64, dwarf::DW_ATE_float);
   return DblTy;
 }
 
@@ -947,6 +945,7 @@ static DISubroutineType *CreateFunctionType(unsigned NumArgs, DIFile *Unit) {
 
 static std::unique_ptr<Module> TheModule;
 static std::map<std::string, AllocaInst *> NamedValues;
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static std::vector<Value *> CoroHandlesInCurrentFunction;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 
@@ -1363,7 +1362,7 @@ Value *IfExprAST::codegen() {
   if (!CondV)
     return nullptr;
 
-  // Convert condition to a bool by comparing equal to 0.0.
+  // Convert condition to a bool by comparing non-equal to 0.0.
   CondV = Builder.CreateFCmpONE(
       CondV, ConstantFP::get(TheContext, APFloat(0.0)), "ifcond");
 
@@ -1488,7 +1487,7 @@ Value *ForExprAST::codegen() {
   Value *NextVar = Builder.CreateFAdd(CurVar, StepVal, "nextvar");
   Builder.CreateStore(NextVar, Alloca);
 
-  // Convert condition to a bool by comparing equal to 0.0.
+  // Convert condition to a bool by comparing non-equal to 0.0.
   EndCond = Builder.CreateFCmpONE(
       EndCond, ConstantFP::get(TheContext, APFloat(0.0)), "loopcond");
 
@@ -1765,6 +1764,7 @@ Function *FunctionAST::codegen() {
 static void InitializeModule() {
   // Open a new module.
   TheModule = llvm::make_unique<Module>("my cool jit", TheContext);
+  TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
 }
 
 static void HandleDefinition() {
@@ -1803,7 +1803,7 @@ static void HandleTopLevelExpression() {
 
 /// top ::= definition | external | expression | ';'
 static void MainLoop() {
-  while (true) {
+  while (1) {
     switch (CurTok) {
     case tok_eof:
       return;
@@ -1850,6 +1850,10 @@ extern "C" DLLEXPORT double printd(double X) {
 //===----------------------------------------------------------------------===//
 
 int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
   // Install standard binary operators.
   // 1 is lowest precedence.
   BinopPrecedence['='] = 2;
@@ -1860,6 +1864,8 @@ int main() {
 
   // Prime the first token.
   getNextToken();
+
+  TheJIT = llvm::make_unique<KaleidoscopeJIT>();
 
   InitializeModule();
 
@@ -1879,7 +1885,7 @@ int main() {
   // but we'd like actual source locations.
   KSDbgInfo.TheCU = DBuilder->createCompileUnit(
       dwarf::DW_LANG_C, DBuilder->createFile("test.ks", "."),
-      "Kaleidoscope Compiler", false, "", 0);
+      "Kaleidoscope Compiler", 0, "", 0);
 
   // Run the main "interpreter loop" now.
   MainLoop();
@@ -1887,64 +1893,8 @@ int main() {
   // Finalize the debug info.
   DBuilder->finalize();
 
-  // Initialize the target registry etc.
-  //InitializeAllTargetInfos();
-  //InitializeAllTargets();
-  //InitializeAllTargetMCs();
-  //InitializeAllAsmParsers();
-  //InitializeAllAsmPrinters();
-
-  LLVMInitializeX86TargetInfo();
-  LLVMInitializeX86Target();
-  LLVMInitializeX86TargetMC();
-  LLVMInitializeX86AsmParser();
-  LLVMInitializeX86AsmPrinter();
-
-  auto TargetTriple = sys::getDefaultTargetTriple();
-  TheModule->setTargetTriple(TargetTriple);
-
-  std::string Error;
-  auto Target = TargetRegistry::lookupTarget(TargetTriple, Error);
-
-  // Print an error and exit if we couldn't find the requested target.
-  // This generally occurs if we've forgotten to initialise the
-  // TargetRegistry or we have a bogus target triple.
-  if (!Target) {
-    errs() << Error;
-    return 1;
-  }
-
-  auto CPU = "generic";
-  auto Features = "";
-
-  TargetOptions opt;
-  auto RM = Optional<Reloc::Model>();
-  auto TheTargetMachine =
-      Target->createTargetMachine(TargetTriple, CPU, Features, opt, RM);
-
-  TheModule->setDataLayout(TheTargetMachine->createDataLayout());
-
-  auto Filename = "output.o";
-  std::error_code EC;
-  raw_fd_ostream dest(Filename, EC, sys::fs::F_None);
-
-  if (EC) {
-    errs() << "Could not open file: " << EC.message();
-    return 1;
-  }
-
-  legacy::PassManager pass;
-  auto FileType = TargetMachine::CGFT_ObjectFile;
-
-  if (TheTargetMachine->addPassesToEmitFile(pass, dest, FileType)) {
-    errs() << "TheTargetMachine can't emit a file of this type";
-    return 1;
-  }
-
-  pass.run(*TheModule);
-  dest.flush();
-
-  outs() << "Wrote " << Filename << "\n";
+  // Print out all of the generated code.
+  TheModule->print(errs(), nullptr);
 
   return 0;
 }
